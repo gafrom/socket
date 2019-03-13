@@ -1,4 +1,5 @@
 require 'socket'
+require 'forwardable'
 
 socket = Socket.new :INET, :STREAM
 addr = Socket.sockaddr_in(3000, '0.0.0.0')
@@ -8,9 +9,8 @@ socket.listen(0) # to start listening, so we could use #accept method
 
 rs = [socket]
 ws = []
-messages = {}.tap { |hsh| hsh.default = '' }
+messages = Hash.new { |hsh, key| hsh[key] = Message.new }
 max_len = 2000
-END_TOKEN = 'END'
 
 def accept_connection(socket, rs)
   # Here we accept in a non_blocking fashion and it is wrong people may say,
@@ -23,6 +23,32 @@ rescue IO::EAGAINWaitReadable
   nil
 end
 
+class Message < String
+  extend Forwardable
+
+  END_TOKEN = 'END'
+
+  attr_accessor :body, :bytes_sent
+  def_delegator :@body, :<<
+
+  def initialize
+    @body = ''
+    @bytes_sent = 0
+  end
+
+  def received?
+    @body.rstrip.end_with? END_TOKEN
+  end
+
+  def sent?
+    @bytes_sent == @body.size
+  end
+
+  def remaining
+    @body[@bytes_sent..-1]
+  end
+end
+
 begin
   while true
     reads, writes = IO.select(rs, ws)
@@ -32,12 +58,11 @@ begin
     reads.each do |s|
       next accept_connection(s, rs) if s == socket
 
-      msg = s.read_nonblock(max_len)
-      messages[s] += msg
+      msg_read = s.read_nonblock(max_len)
+      message = messages[s]
+      message << msg_read
 
-      puts messages[s]
-
-      if messages[s].rstrip.end_with? END_TOKEN # we have read it all, now we can write
+      if message.received? # we have read it all, now we can write
         ws << s
       else # we have not read it through, so let's try reading later again
         rs << s
@@ -46,8 +71,11 @@ begin
 
     writes.each do |s|
       # just echoing client's message
-      written_bytes = s.write_nonblock(messages[s])
-      if written_bytes == messages[s].size
+      message = messages[s]
+      written_bytes = s.write_nonblock(message.remaining)
+      message.bytes_sent += written_bytes
+
+      if message.sent?
         s.close # throw away the connection
       else
         ws << s
